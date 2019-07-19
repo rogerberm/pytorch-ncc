@@ -8,94 +8,106 @@ CVLab EPFL 2019
 
 import logging
 import torch
+from torch.nn import functional as F
 
 
 ncc_logger = logging.getLogger(__name__)
 
-
-class PatchStd(torch.nn.Module):
+def patch_mean(images, patch_size):
     """
-    Computes standard deviations within a local window (i.e., convolution-style)
+    Computes the local mean of an image or set of images.
 
-    kernel_size controls the size of the local neighborhood.
+    Args:
+        images (Tensor): Expected size is (n_images, n_channels, *image_size). 1d, 2d, and 3d images are accepted.
+        patch_size (tuple): size of the patch (n_channels, *patch_size)
+
+    Returns:
+        Tensor same size as the image, with local means computed independently for each channel.
+
+    Example::
+        >>> images = torch.randn(4, 3, 15, 15)           # 4 images, 3 channels, 15x15 pixels each
+        >>> patch_size = 3, 5, 5                         # 3 channels, 5x5 pixels neighborhood
+        >>> means = patch_mean(images, patch_size)
+        >>> expected_mean = images[3, 2, :5, :5].mean()  # mean of the third image, channel 2, top left 5x5 patch
+        >>> computed_mean = means[3, 2, 5//2, 5//2]      # computed mean whose 5x5 neighborhood covers same patch
+        >>> computed_mean.isclose(expected_mean).item()
+        1
     """
-    def __init__(self, kernel_size):
-        super().__init__()
+    channels, *patch_size = patch_size
+    dimensions = len(patch_size)
 
-        dimensions = len(kernel_size)
-        assert dimensions in (1, 2, 3), f"Invalid template dimensions {dimensions}. Only 1, 2, or 3 dimensions allowed."
+    padding = tuple(side // 2 for side in patch_size)
 
-        if any(side % 2 == 0 for side in kernel_size):
-            ncc_logger.warning("Might break with even kernel sizes. Kernel size is %s.", kernel_size)
+    conv_f = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
 
-        padding = tuple(side//2 for side in kernel_size)
+    # Convolution with these weights will effectively compute the channel-wise means
+    weights = torch.zeros((channels, channels, *patch_size)).to(images.device)
+    weights.fill_(1 / torch.prod(torch.Tensor(patch_size).float()))
+    channel_selector = torch.eye(channels).byte()
+    weights[1 - channel_selector] = 0
 
-        # Setup convolution to compute local means.
-        conv_module = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)[dimensions - 1]
-        self._patch_mean = conv_module(1, 1, kernel_size=kernel_size, padding=padding, bias=False)
-        self._patch_mean.weight.data.fill_(1 / self._patch_mean.weight.numel())
+    result = conv_f(images, weights, padding=padding, bias=None)
 
-    def forward(self, image):
-        # Compute standard deviation in terms of means: std = E[X^2] - E[X]^2.
-        result = self._patch_mean(image**2) - self._patch_mean(image)**2
-        result = result.sqrt()
+    return result
 
-        return result
+
+def patch_std(image, patch_size):
+    """
+    Computes the local standard deviations of an image or set of images.
+
+    Args:
+        images (Tensor): Expected size is (n_images, n_channels, *image_size). 1d, 2d, and 3d images are accepted.
+        patch_size (tuple): size of the patch (n_channels, *patch_size)
+
+    Returns:
+        Tensor same size as the image, with local standard deviations computed independently for each channel.
+
+    Example::
+        >>> images = torch.randn(4, 3, 15, 15)           # 4 images, 3 channels, 15x15 pixels each
+        >>> patch_size = 3, 5, 5                         # 3 channels, 5x5 pixels neighborhood
+        >>> stds = patch_std(images, patch_size)
+        >>> patch = images[3, 2, :5, :5]
+        >>> expected_std = patch.std(unbiased=False)     # standard deviation of the third image, channel 2, top left 5x5 patch
+        >>> computed_std = stds[3, 2, 5//2, 5//2]        # computed standard deviation whose 5x5 neighborhood covers same patch
+        >>> computed_std.isclose(expected_std).item()
+        1
+    """
+    return (patch_mean(image**2, patch_size) - patch_mean(image, patch_size)**2).sqrt()
+
+
+def channel_normalize(template):
+    """
+    Z-normalize image channels independently.
+    """
+    reshaped_template = template.clone().view(template.shape[0], -1)
+    reshaped_template.sub_(reshaped_template.mean(dim=-1, keepdim=True))
+    reshaped_template.div_(reshaped_template.std(dim=-1, keepdim=True, unbiased=False))
+
+    return reshaped_template.view_as(template)
 
 
 class NCC(torch.nn.Module):
-    """
-    Computes the Normalized Cross-Correlation of an image to a template.
-
-    NCC(I, T) = (1 / sigma_I) * corr(I, T_tilde)
-        where sigma_I contains the local standard deviations of the image,
-        and T_tilde is the normalized template.
-    """
-    def __init__(self, template):
+    def __init__(self, template, keep_channels=False):
         super().__init__()
 
-        self._std = PatchStd(kernel_size=template.shape)
+        self.keep_channels = keep_channels
 
-        dimensions = len(template.shape)
-        padding = tuple(side//2 for side in template.shape)
+        channels, *template_shape = template.shape
+        dimensions = len(template_shape)
+        self.padding = tuple(side // 2 for side in template_shape)
 
-        # Setup convolution to compute correlation to normalized template.
-        conv_module = (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)[dimensions - 1]
-        self._corr = conv_module(1, 1, kernel_size=template.shape, padding=padding, bias=False)
-        _normalized_template = (template - template.mean()) / template.std(unbiased=False)
-        self._corr.weight.data[0, 0].copy_(_normalized_template / _normalized_template.numel())
+        self.conv_f = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
+        self.normalized_template = channel_normalize(template)
+        self.normalized_template = self.normalized_template.repeat(channels, *(self.normalized_template.dim() * (1,)))
+        channel_selector = torch.eye(channels).byte()
+        self.normalized_template[1 - channel_selector] = 0
+        self.normalized_template.div_(torch.prod(torch.Tensor(template_shape)).item())
 
     def forward(self, image):
-        result = self._corr(image) / self._std(image)
+        result = self.conv_f(image, self.normalized_template, padding=self.padding, bias=None)
+        std = patch_std(image, self.normalized_template.shape[1:])
+        result.div_(std)
+        if not self.keep_channels:
+            result = result.mean(dim=1)
 
         return result
-
-
-def test_ncc_nd(template, tolerance=1e-6):
-    """
-    Tests that values of NCC are correct.
-
-    In particular, applies NCC from a template to itself, and ensures that:
-        - Center element is 1.
-        - All elements are within the [-1, 1] range.
-    """
-    ncc_nd = NCC(template)
-    result_nd = ncc_nd(template[None, None, ...])
-
-    central_index = tuple(slice(side//2, side//2 + 1) for side in result_nd.shape)
-    assert result_nd[central_index].allclose(torch.Tensor((1,))), "Center element is not close to 1."
-
-    assert torch.all(result_nd**2 - tolerance < 1), "Some elements are either below -1 or above 1."
-
-    print(f"All tests passed for {len(template.shape)}d NCC.")
-
-
-def test_NCC():
-    """
-    Ensures NCC works as it should for 1d, 2d, and 3d template matching.
-    """
-    list(map(test_ncc_nd, (torch.randn(d * [5]) for d in (1, 2, 3))))
-
-
-if __name__ == "__main__":
-    test_NCC()
