@@ -42,8 +42,9 @@ def patch_mean(images, patch_shape):
     conv_f = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
 
     # Convolution with these weights will effectively compute the channel-wise means
-    weights = torch.zeros((channels, channels, *patch_size)).to(images.device)
-    weights.fill_(1 / torch.prod(torch.Tensor(patch_size).float()))
+    patch_elements = torch.prod(torch.Tensor(patch_size))
+    weights = torch.full((channels, channels, *patch_size), 1 / patch_elements.float()).to(images.device)
+    # Make convolution operate on single channels
     channel_selector = torch.eye(channels).byte()
     weights[1 - channel_selector] = 0
 
@@ -118,9 +119,11 @@ class NCC(torch.nn.Module):
 
         self.conv_f = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
         self.normalized_template = channel_normalize(template)
-        self.normalized_template = self.normalized_template.repeat(channels, *(self.normalized_template.dim() * (1,)))
+        self.normalized_template = self.normalized_template.repeat(channels, *(template.dim() * (1,)))
+        # Make convolution operate on single channels
         channel_selector = torch.eye(channels).byte()
         self.normalized_template[1 - channel_selector] = 0
+        # Reweight so that output is averaged
         self.normalized_template.div_(torch.prod(torch.Tensor(template_shape)).item())
 
     def forward(self, image):
