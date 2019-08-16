@@ -36,19 +36,20 @@ def patch_mean(images, patch_shape):
     """
     channels, *patch_size = patch_shape
     dimensions = len(patch_size)
-
     padding = tuple(side // 2 for side in patch_size)
 
-    conv_f = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
+    conv = (F.conv1d, F.conv2d, F.conv3d)[dimensions - 1]
 
     # Convolution with these weights will effectively compute the channel-wise means
     patch_elements = torch.Tensor(patch_size).prod().item()
-    weights = torch.full((channels, channels, *patch_size), fill_value=1 / patch_elements).to(images.device)
+    weights = torch.full((channels, channels, *patch_size), fill_value=1 / patch_elements)
+    weights = weights.to(images.device)
+
     # Make convolution operate on single channels
     channel_selector = torch.eye(channels).byte()
     weights[1 - channel_selector] = 0
 
-    result = conv_f(images, weights, padding=padding, bias=None)
+    result = conv(images, weights, padding=padding, bias=None)
 
     return result
 
