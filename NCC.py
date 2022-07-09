@@ -46,8 +46,8 @@ def patch_mean(images, patch_shape):
     weights = weights.to(images.device)
 
     # Make convolution operate on single channels
-    channel_selector = torch.eye(channels).byte()
-    weights[1 - channel_selector] = 0
+    channel_selector = torch.eye(channels).bool()
+    weights[~channel_selector] = 0
 
     result = conv(images, weights, padding=padding, bias=None)
 
@@ -123,8 +123,8 @@ class NCC(torch.nn.Module):
         ones = template.dim() * (1, )
         self.normalized_template = self.normalized_template.repeat(channels, *ones)
         # Make convolution operate on single channels
-        channel_selector = torch.eye(channels).byte()
-        self.normalized_template[1 - channel_selector] = 0
+        channel_selector = torch.eye(channels).bool()
+        self.normalized_template[~channel_selector] = 0
         # Reweight so that output is averaged
         patch_elements = torch.Tensor(template_shape).prod().item()
         self.normalized_template.div_(patch_elements)
